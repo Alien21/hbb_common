@@ -4,7 +4,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use protobuf::Message;
 use sodiumoxide::crypto::{
-    box_,
+    box_, generichash,
     secretbox::{self, Key, Nonce},
 };
 use std::{
@@ -24,8 +24,30 @@ use tokio_util::codec::Framed;
 pub trait TcpStreamTrait: AsyncRead + AsyncWrite + Unpin {}
 pub struct DynTcpStream(pub Box<dyn TcpStreamTrait + Send + Sync>);
 
+/// Prefix of what the server signs as `KxParams`. The same key signs other messages, and a
+/// protobuf carries no type of its own, so the prefix is what keeps them apart.
+pub const KX_PARAMS_DOMAIN: &[u8] = b"rdkx-params";
+
+const KX_SPLIT_CONTEXT: &[u8] = b"rdkx-spl";
+const KX_SPLIT_INITIATOR: u8 = 1;
+const KX_SPLIT_RESPONDER: u8 = 2;
+
+/// What both sides saw during the key exchange, each from its own side of the wire, mixed
+/// into the split keys.
+pub struct KxTranscript<'a> {
+    /// The ephemeral public key of the side that sent the sealed key.
+    pub initiator_pk: &'a [u8],
+    /// The ephemeral public key the sealed key was sealed to.
+    pub responder_pk: &'a [u8],
+    /// The version the responder advertised: what it sent, what the initiator received.
+    pub advertised: u32,
+    /// The version the initiator picked.
+    pub picked: u32,
+}
+
+/// The sending key, the send and receive counters, and the receiving key where it differs.
 #[derive(Clone)]
-pub struct Encrypt(pub Key, pub u64, pub u64);
+pub struct Encrypt(pub Key, pub u64, pub u64, Option<Key>);
 
 pub struct FramedStream(
     pub Framed<DynTcpStream, BytesCodec>,
@@ -295,7 +317,43 @@ impl<R: AsyncRead + AsyncWrite + Unpin> TcpStreamTrait for R {}
 
 impl Encrypt {
     pub fn new(key: Key) -> Self {
-        Self(key, 0, 0)
+        Self(key, 0, 0, None)
+    }
+
+    /// Version 1: the initiator, the side that sent the sealed key, sends under one subkey and
+    /// receives under the other; the responder the reverse.
+    pub fn new_split(key: Key, is_initiator: bool, t: &KxTranscript) -> ResultType<Self> {
+        let initiator = Self::derive_subkey(&key, KX_SPLIT_INITIATOR, t)?;
+        let responder = Self::derive_subkey(&key, KX_SPLIT_RESPONDER, t)?;
+        Ok(if is_initiator {
+            Self(initiator, 0, 0, Some(responder))
+        } else {
+            Self(responder, 0, 0, Some(initiator))
+        })
+    }
+
+    fn derive_subkey(key: &Key, direction: u8, t: &KxTranscript) -> ResultType<Key> {
+        if t.initiator_pk.len() != box_::PUBLICKEYBYTES
+            || t.responder_pk.len() != box_::PUBLICKEYBYTES
+        {
+            bail!("key exchange transcript has a public key of the wrong length");
+        }
+        let failed = |_| anyhow::anyhow!("key derivation failed");
+        let mut h =
+            generichash::State::new(Some(secretbox::KEYBYTES), Some(&key.0)).map_err(failed)?;
+        for part in [
+            KX_SPLIT_CONTEXT,
+            &[direction],
+            &t.advertised.to_le_bytes(),
+            &t.picked.to_le_bytes(),
+            t.initiator_pk,
+            t.responder_pk,
+        ] {
+            h.update(part).map_err(failed)?;
+        }
+        let mut subkey = [0u8; secretbox::KEYBYTES];
+        subkey.copy_from_slice(h.finalize().map_err(failed)?.as_ref());
+        Ok(Key(subkey))
     }
 
     pub fn dec(&mut self, bytes: &mut BytesMut) -> Result<(), Error> {
@@ -304,7 +362,7 @@ impl Encrypt {
         }
         self.2 += 1;
         let nonce = FramedStream::get_nonce(self.2);
-        match secretbox::open(bytes, &nonce, &self.0) {
+        match secretbox::open(bytes, &nonce, self.3.as_ref().unwrap_or(&self.0)) {
             Ok(res) => {
                 bytes.clear();
                 bytes.put_slice(&res);
@@ -340,5 +398,34 @@ impl Encrypt {
         let mut key = [0u8; secretbox::KEYBYTES];
         key[..].copy_from_slice(&symmetric_key);
         Ok(Key(key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v1_matches_client_wire_vectors_and_separates_directions() {
+        let transcript = KxTranscript {
+            initiator_pk: &[0x22; 32], responder_pk: &[0x33; 32], advertised: 1, picked: 1,
+        };
+        let key = Key([0x11; 32]);
+        let mut client = Encrypt::new_split(key.clone(), true, &transcript).unwrap();
+        let mut server = Encrypt::new_split(key, false, &transcript).unwrap();
+        let hex = |value: &[u8]| value.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        assert_eq!(hex(&client.0.0), "c189ec6e1935c0751cfc85a0f075405cae507d7925bb19687caf56cbb54e0ecf");
+        assert_eq!(hex(&server.0.0), "8a62648e9195cb10ea900c0a24d2a166c1e982347a2dc6833c3e756bf5715d36");
+        for plain in [b"first".as_slice(), b"second".as_slice()] {
+            let sent = client.enc(plain);
+            let reply = server.enc(plain);
+            assert_ne!(sent, reply);
+            let mut received = BytesMut::from(sent.as_slice());
+            server.dec(&mut received).unwrap();
+            assert_eq!(&received[..], plain);
+            let mut received = BytesMut::from(reply.as_slice());
+            client.dec(&mut received).unwrap();
+            assert_eq!(&received[..], plain);
+        }
     }
 }
